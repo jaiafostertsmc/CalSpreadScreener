@@ -3,3 +3,5 @@ yfinance
 numpy
 scipy
 requests
+sycopg2-binary
+python-dotenv
