@@ -4,14 +4,25 @@ from datetime import datetime, timedelta
 from scipy.interpolate import interp1d
 import numpy as np
 import requests
-import json
 import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
 
 # === CONFIG ===
 FINNHUB_API_KEY = 'd0ahjohr01qm3l9lfmlgd0ahjohr01qm3l9lfmm0'
-CACHE_FILE = 'earnings_cache.json'
+
+# === DATABASE SETUP ===
+
+# For production use:
+# DB_URL = os.environ.get("DATABASE_URL")
+
+# For now, using your provided Neon connection string:
+DB_URL = "postgresql://neondb_owner:npg_3pCaNTHPGW7X@ep-young-bar-aax29iu0-pooler.westus3.azure.neon.tech/neondb?sslmode=require&channel_binding=require"
+
+def get_db_connection():
+    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
 
 # === UTILITIES ===
 
@@ -130,8 +141,12 @@ def screen():
 @app.route('/earnings', methods=['GET'])
 def get_recent_earnings():
     try:
-        with open(CACHE_FILE, "r") as f:
-            data = json.load(f)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM earnings_calendar ORDER BY date DESC LIMIT 100;")
+        data = cur.fetchall()
+        cur.close()
+        conn.close()
         return jsonify(data)
     except Exception as e:
         return jsonify({'error': str(e)})
@@ -139,31 +154,23 @@ def get_recent_earnings():
 @app.route('/update_cache', methods=['GET'])
 def update_cache():
     try:
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, "r") as f:
-                cached = json.load(f)
-        else:
-            cached = []
+        conn = get_db_connection()
+        cur = conn.cursor()
 
-        cached_keys = {(e["symbol"], e["date"]) for e in cached}
+        cur.execute("CREATE TABLE IF NOT EXISTS earnings_calendar (symbol TEXT, date TEXT, hour TEXT, PRIMARY KEY (symbol, date));")
+        cur.execute("SELECT symbol, date FROM earnings_calendar;")
+        cached_keys = {(row['symbol'], row['date']) for row in cur.fetchall()}
 
         today = datetime.utcnow().date()
         yesterday = today - timedelta(days=1)
         tomorrow = today + timedelta(days=1)
 
         url = "https://finnhub.io/api/v1/calendar/earnings"
-
         params_yesterday = {'from': yesterday.isoformat(), 'to': yesterday.isoformat(), 'token': FINNHUB_API_KEY}
         params_tomorrow = {'from': tomorrow.isoformat(), 'to': tomorrow.isoformat(), 'token': FINNHUB_API_KEY}
 
-        r1 = requests.get(url, params=params_yesterday)
-        r2 = requests.get(url, params=params_tomorrow)
-
-        earnings_yesterday = r1.json().get("earningsCalendar", [])
-        earnings_tomorrow = r2.json().get("earningsCalendar", [])
-
-        print("Finnhub Yesterday Earnings:", earnings_yesterday)
-        print("Finnhub Tomorrow Earnings:", earnings_tomorrow)
+        earnings_yesterday = requests.get(url, params=params_yesterday).json().get("earningsCalendar", [])
+        earnings_tomorrow = requests.get(url, params=params_tomorrow).json().get("earningsCalendar", [])
 
         new_entries = []
 
@@ -171,26 +178,21 @@ def update_cache():
             if e.get("hour") == "amc":
                 key = (e["symbol"], yesterday.isoformat())
                 if key not in cached_keys:
-                    new_entries.append({
-                        "symbol": e["symbol"],
-                        "date": yesterday.isoformat(),
-                        "hour": "amc"
-                    })
+                    cur.execute("INSERT INTO earnings_calendar (symbol, date, hour) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                                (e["symbol"], yesterday.isoformat(), "amc"))
+                    new_entries.append({"symbol": e["symbol"], "date": yesterday.isoformat(), "hour": "amc"})
 
         for e in earnings_tomorrow:
             if e.get("hour") == "bmo":
                 key = (e["symbol"], tomorrow.isoformat())
                 if key not in cached_keys:
-                    new_entries.append({
-                        "symbol": e["symbol"],
-                        "date": tomorrow.isoformat(),
-                        "hour": "bmo"
-                    })
+                    cur.execute("INSERT INTO earnings_calendar (symbol, date, hour) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                                (e["symbol"], tomorrow.isoformat(), "bmo"))
+                    new_entries.append({"symbol": e["symbol"], "date": tomorrow.isoformat(), "hour": "bmo"})
 
-        cached.extend(new_entries)
-
-        with open(CACHE_FILE, "w") as f:
-            json.dump(cached, f, indent=2)
+        conn.commit()
+        cur.close()
+        conn.close()
 
         return jsonify({
             "message": f"Added {len(new_entries)} new earnings entries.",
@@ -203,7 +205,7 @@ def update_cache():
 @app.route('/wake', methods=['GET'])
 def wake():
     return jsonify({"message": "I'm awake!"})
-    
+
 # === RUN SERVER ===
 
 if __name__ == '__main__':
